@@ -156,6 +156,13 @@ def get_npu_properties():
     return driver.active.utils.get_device_properties(device)
 
 
+def _balance_bv_for_core_grid(V: int, BV: int, task_groups: int) -> int:
+    num_core = get_npu_properties()["num_aicore"]
+    if BV > 16 and task_groups * triton.cdiv(V, BV) < max(num_core // 2, 1):
+        return BV // 2
+    return BV
+
+
 def _launch_core_grid(kernel, *, task_num: int, kernel_kwargs: dict, **compile_opts) -> None:
     num_core = get_npu_properties()["num_aicore"]
     kernel[(num_core,)](task_num=task_num, num_core=num_core, **compile_opts, **kernel_kwargs)
@@ -723,6 +730,8 @@ def chunk_gated_delta_rule_fwd_h_npu(
         and K == BK
         and V % BV == 0
     )
+    if oneslab:
+        BV = _balance_bv_for_core_grid(V, BV, N * HV)
     kwargs = dict(
         k=k,
         v=u,
