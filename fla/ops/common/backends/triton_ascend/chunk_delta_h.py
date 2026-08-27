@@ -715,6 +715,7 @@ def chunk_gated_delta_rule_fwd_h_npu(
         final_state = k.new_zeros(N, HV, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
+    use_g = g is not None
     g, g_ratio, g_last_exp = _prepare_fwd_g_gates(
         g, B=B, T=T, HV=HV, BT=BT, cu_seqlens=cu_seqlens,
     )
@@ -730,7 +731,7 @@ def chunk_gated_delta_rule_fwd_h_npu(
         and K == BK
         and V % BV == 0
     )
-    if oneslab:
+    if oneslab and use_g:
         BV = _balance_bv_for_core_grid(V, BV, N * HV)
     kwargs = dict(
         k=k,
@@ -805,6 +806,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_npu(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    SPLIT_V: tl.constexpr,
     USE_G: tl.constexpr,
     USE_G_PRECOMP: tl.constexpr,
     USE_GK: tl.constexpr,
@@ -816,7 +818,13 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_npu(
     core_id = tl.program_id(0)
     T_max = T
     for task_id in tl.range(core_id, task_num, num_core):
-        i_nh = task_id.to(tl.int64)
+        NV: tl.constexpr = tl.cdiv(V, BV)
+        i_v_start = 0
+        if SPLIT_V:
+            i_v_start = task_id % NV
+            i_nh = (task_id // NV).to(tl.int64)
+        else:
+            i_nh = task_id.to(tl.int64)
         i_n, i_h = i_nh // HV, i_nh % HV
         if IS_VARLEN:
             bos, eos = (
@@ -866,8 +874,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_npu(
             g_ratio_base = g_ratio
             g_last_exp_base = g_last_exp
 
-        NV = tl.cdiv(V, BV)
-        for i_v in range(NV):
+        NVI: tl.constexpr = 1 if SPLIT_V else NV
+        for i_v_offset in range(NVI):
+            i_v = i_v_start + i_v_offset
             v_start = i_v * BV
 
             if STATE_V_FIRST:
@@ -1214,9 +1223,12 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
     )
     gate_inline = g is not None and not use_g_precomp
     BK, BV = _select_bwd_dhu_tiles(K, V, state_v_first, gate_inline=gate_inline)
+    balanced_bv = _balance_bv_for_core_grid(V, BV, N * HV) if g is not None else BV
+    split_v = balanced_bv != BV
+    BV = balanced_bv
     _launch_core_grid(
         chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_npu,
-        task_num=N * HV,
+        task_num=N * HV * (triton.cdiv(V, BV) if split_v else 1),
         kernel_kwargs={
             "q": q,
             "k": k,
@@ -1243,6 +1255,7 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
             "BT": BT,
             "BK": BK,
             "BV": BV,
+            "SPLIT_V": split_v,
             "USE_G": g is not None,
             "USE_G_PRECOMP": use_g_precomp,
             "USE_GK": gk is not None,
