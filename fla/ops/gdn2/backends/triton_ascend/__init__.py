@@ -14,7 +14,7 @@ import triton
 
 from fla.backends import BaseBackend, register
 
-# The grouped diagonal kernel keeps the padded K dimension in one UB slab.
+# keep the backend verifier aligned with chunk_gdn2's public K <= 256 contract.
 _MAX_FWD_INTRA_BK = 256
 
 
