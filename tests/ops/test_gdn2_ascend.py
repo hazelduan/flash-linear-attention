@@ -106,3 +106,45 @@ def test_chunk_fwd_intra_leaves(K, dtype, varlen):
             ref_kk[0, start:end, :, :end - start] = kk.tril(diagonal=-1).transpose(0, 1)
     assert_close('Aqk', ref_qk.to(dtype), Aqk.cpu(), 0.005)
     assert_close('Akk', ref_kk, Akk.cpu(), 0.005)
+
+
+@pytest.mark.skipif(not IS_NPU, reason='Ascend kernel regression')
+@pytest.mark.parametrize(
+    ('K', 'V', 'dtype'),
+    [(128, 64, torch.bfloat16), (64, 128, torch.float16), (256, 128, torch.bfloat16)],
+    ids=['K128-V64-bf16', 'K64-V128-fp16', 'K256-V128-bf16'],
+)
+def test_chunk_asymmetric_head_dims(K, V, dtype):
+    """Preserve outputs and gradients when key and value tiles split independently."""
+    from test_gdn2 import test_chunk as check_chunk
+
+    check_chunk(
+        B=1,
+        T=100,
+        H=2,
+        K=K,
+        V=V,
+        scale=1.0,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=False,
+        safe_gate=False,
+        dtype=dtype,
+    )
+
+
+@pytest.mark.skipif(not IS_NPU, reason='Ascend kernel regression')
+@pytest.mark.parametrize(('K', 'V'), [(128, 256), (256, 512)], ids=['K128-V256', 'K256-V512'])
+def test_chunk_varlen_saved_state_v_first(K, V):
+    """Check saved WY buffers and transposed states with expanded value heads."""
+    from test_gdn2 import test_chunk_varlen as check_chunk_varlen
+
+    check_chunk_varlen(
+        cu_seqlens=[0, 15, 80, 145],
+        H=2,
+        K=K,
+        V=V,
+        use_gate_in_kernel=True,
+        dtype=torch.bfloat16,
+        state_v_first=True,
+        disable_recompute=True,
+    )
