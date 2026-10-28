@@ -7,10 +7,13 @@
 
 """Ascend dispatch and leaf-kernel coverage for GDN-2."""
 
+from inspect import signature, unwrap
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from fla.ops.gdn2 import chunk_gdn2
 from fla.utils import IS_NPU, assert_close, device
 
 pytestmark = pytest.mark.skipif(not IS_NPU, reason="Ascend NPU required")
@@ -157,6 +160,68 @@ def test_recompute_w_u_fwd_gdn2_npu_leaf(layout, dtype, K, V, has_q):
             assert_close(name, ref, tri, 0.005)
 
 
+def _route_inputs(dtype: torch.dtype, T: int = _BT) -> dict[str, torch.Tensor]:
+    torch.manual_seed(42)
+    shape_k = (1, T, 1, 32)
+    shape_v = (1, T, 1, 32)
+    tensors = {
+        "q": torch.randn(shape_k, dtype=dtype, device=device) * 0.1,
+        "k": torch.randn(shape_k, dtype=dtype, device=device) * 0.1,
+        "v": torch.randn(shape_v, dtype=dtype, device=device) * 0.1,
+        "g": torch.empty(shape_k, dtype=dtype, device=device).uniform_(-0.05, -0.01),
+        "b": torch.rand(shape_k, dtype=dtype, device=device) * 0.05,
+        "w": torch.rand(shape_v, dtype=dtype, device=device) * 0.5,
+    }
+    for tensor in tensors.values():
+        tensor.requires_grad_()
+    return tensors
+
+
+@pytest.mark.parametrize("layout", ("dense", "varlen"))
+@pytest.mark.parametrize("disable_recompute", [False, True], ids=["recompute", "saved-forward"])
+def test_gdn2_ascend_recompute_and_bwd_intra_routes(monkeypatch, layout, disable_recompute):
+    """Training must route each reachable leaf exactly as its recompute policy requires."""
+    from fla.ops.gdn2.backends.triton_ascend import chunk_intra as npu_chunk_intra
+    from fla.ops.gdn2.backends.triton_ascend import wy_fast as npu_wy
+
+    wy_spy = Mock(wraps=npu_wy.recompute_w_u_fwd_gdn2_npu)
+    bwd_intra_spy = Mock(wraps=npu_chunk_intra.chunk_gdn2_bwd_intra_npu)
+    monkeypatch.setattr(npu_wy, "recompute_w_u_fwd_gdn2_npu", wy_spy)
+    monkeypatch.setattr(npu_chunk_intra, "chunk_gdn2_bwd_intra_npu", bwd_intra_spy)
+
+    cu_seqlens = None
+    cu_seqlens_cpu = None
+    if layout == "varlen":
+        cu_seqlens = torch.tensor([0, 15, 80], dtype=torch.int64, device=device)
+        cu_seqlens_cpu = cu_seqlens.cpu()
+    inputs = _route_inputs(torch.bfloat16, T=80 if layout == "varlen" else _BT)
+    o, final_state = chunk_gdn2(
+        **inputs,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        disable_recompute=disable_recompute,
+        output_final_state=True,
+    )
+    (o.float().sum() + final_state.float().sum()).backward()
+
+    expected_q_is_none = [False] if disable_recompute else [True, False]
+    assert wy_spy.call_count == len(expected_q_is_none)
+    assert [call.kwargs["q"] is None for call in wy_spy.call_args_list] == expected_q_is_none
+    bwd_intra_spy.assert_called_once()
+    bwd_kwargs = bwd_intra_spy.call_args.kwargs
+    assert bwd_kwargs["chunk_size"] == _BT
+
+    routed_calls = [*wy_spy.call_args_list, bwd_intra_spy.call_args]
+    for call in routed_calls:
+        if cu_seqlens is None:
+            assert call.kwargs["cu_seqlens"] is None
+            assert call.kwargs["chunk_indices"] is None
+        else:
+            assert torch.equal(call.kwargs["cu_seqlens"], cu_seqlens)
+            assert call.kwargs["chunk_indices"].ndim == 2
+            assert call.kwargs["chunk_indices"].shape[-1] == 2
+
+
 def _wy_verifier_args(
     *,
     dtype: torch.dtype = torch.float16,
@@ -176,6 +241,57 @@ def _wy_verifier_args(
         "q": torch.zeros_like(k),
         "gk": torch.zeros_like(k),
     }
+
+
+def _bwd_intra_verifier_args(
+    *,
+    dtype: torch.dtype = torch.float16,
+    B: int = 1,
+    K: int = 32,
+    chunk_size: int = _BT,
+) -> dict[str, torch.Tensor | int]:
+    x = torch.zeros(B, 1, 1, K, dtype=dtype, device=device)
+    dA = torch.zeros(B, 1, 1, chunk_size, dtype=dtype, device=device)
+    return {
+        "q": x.clone(),
+        "k": x,
+        "g": x.clone(),
+        "b": x.clone(),
+        "dAqk": dA,
+        "dAkk": dA.clone(),
+        "dq": x.clone(),
+        "dk": x.clone(),
+        "db": x.clone(),
+        "dg": x.clone(),
+        "chunk_size": chunk_size,
+    }
+
+
+@pytest.mark.parametrize("dtype", _SUPPORTED_DTYPES, ids=("fp16", "bf16", "fp32"))
+@pytest.mark.parametrize("leaf", ("wy", "bwd_intra"))
+def test_gdn2_ascend_leaf_verifiers_accept_supported_dtypes(leaf, dtype):
+    from fla.ops.gdn2.backends.triton_ascend import TritonAscendGDN2Backend
+
+    backend = TritonAscendGDN2Backend()
+    if leaf == "wy":
+        accepted, reason = backend.recompute_w_u_fwd_gdn2_verifier(**_wy_verifier_args(dtype=dtype))
+    else:
+        accepted, reason = backend.chunk_gdn2_bwd_intra_verifier(**_bwd_intra_verifier_args(dtype=dtype))
+    assert accepted
+    assert reason is None
+
+
+@pytest.mark.parametrize("leaf", ("wy", "bwd_intra"))
+def test_gdn2_ascend_leaf_verifiers_accept_ub_boundary(leaf):
+    from fla.ops.gdn2.backends.triton_ascend import TritonAscendGDN2Backend
+
+    backend = TritonAscendGDN2Backend()
+    if leaf == "wy":
+        accepted, reason = backend.recompute_w_u_fwd_gdn2_verifier(**_wy_verifier_args(K=256, V=256))
+    else:
+        accepted, reason = backend.chunk_gdn2_bwd_intra_verifier(**_bwd_intra_verifier_args(K=256))
+    assert accepted
+    assert reason is None
 
 
 def test_recompute_w_u_fwd_gdn2_verifier_accepts_partitioned_v():
@@ -239,3 +355,101 @@ def test_recompute_w_u_fwd_gdn2_verifier_rejects_invalid_contract(case, reason_f
     assert not accepted
     assert reason is not None
     assert reason_fragment in reason
+
+
+@pytest.mark.parametrize(
+    ("case", "reason_fragment"),
+    [
+        pytest.param("chunk-size", "chunk_size=64", id="chunk-size"),
+        pytest.param("k-zero", "1 <= K <= 256", id="k-zero"),
+        pytest.param("k-oversized", "1 <= K <= 256", id="k-oversized"),
+        pytest.param("packed-batch", "batch size 1", id="packed-batch"),
+        pytest.param("index-dtype", "int32 or int64", id="index-dtype"),
+        pytest.param("cu-seqlens-shape", "rank-1 cu_seqlens", id="cu-seqlens-shape"),
+        pytest.param("chunk-indices-shape", "chunk_indices shaped [NT, 2]", id="chunk-indices-shape"),
+        pytest.param("shape", "shape", id="shape"),
+        pytest.param("device", "same NPU device", id="device"),
+        pytest.param("dtype", "unsupported dtype", id="dtype"),
+    ],
+)
+def test_chunk_gdn2_bwd_intra_verifier_rejects_invalid_contract(case, reason_fragment):
+    from fla.ops.gdn2.backends.triton_ascend import TritonAscendGDN2Backend
+
+    if case == "k-zero":
+        kwargs = _bwd_intra_verifier_args(K=0)
+    elif case == "k-oversized":
+        kwargs = _bwd_intra_verifier_args(K=257)
+    elif case == "packed-batch":
+        kwargs = _bwd_intra_verifier_args(B=2)
+        kwargs["cu_seqlens"] = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    else:
+        kwargs = _bwd_intra_verifier_args(chunk_size=32 if case == "chunk-size" else _BT)
+        if case == "index-dtype":
+            kwargs["chunk_indices"] = torch.tensor([[0, 0]], dtype=torch.float32, device=device)
+        elif case == "cu-seqlens-shape":
+            kwargs["cu_seqlens"] = torch.tensor([[0, 1]], dtype=torch.int64, device=device)
+        elif case == "chunk-indices-shape":
+            kwargs["chunk_indices"] = torch.tensor([0, 0], dtype=torch.int64, device=device)
+        elif case == "shape":
+            kwargs["dAkk"] = torch.zeros(1, 1, 1, 32, dtype=torch.float16, device=device)
+        elif case == "device":
+            kwargs["q"] = kwargs["q"].cpu()
+        elif case == "dtype":
+            kwargs["q"] = kwargs["q"].to(torch.int32)
+
+    accepted, reason = TritonAscendGDN2Backend().chunk_gdn2_bwd_intra_verifier(**kwargs)
+    assert not accepted
+    assert reason is not None
+    assert reason_fragment in reason
+
+
+def test_chunk_gdn2_bwd_intra_signatures():
+    """Keep the Ascend executor and verifier aligned with the native entry."""
+    from fla.ops.gdn2.backends.triton_ascend import TritonAscendGDN2Backend
+    from fla.ops.gdn2.backends.triton_ascend.chunk_intra import chunk_gdn2_bwd_intra_npu
+    from fla.ops.gdn2.chunk_intra import chunk_gdn2_bwd_intra
+
+    expected = signature(chunk_gdn2_bwd_intra).parameters
+    for function in (chunk_gdn2_bwd_intra_npu, TritonAscendGDN2Backend().chunk_gdn2_bwd_intra_verifier):
+        actual = signature(function).parameters
+        assert list(actual) == list(expected)
+        assert [p.default for p in actual.values()] == [p.default for p in expected.values()]
+
+
+@pytest.mark.parametrize('layout', ['dense', 'varlen'])
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16], ids=['fp32', 'bf16'])
+@pytest.mark.parametrize('lower_bound', [None, -2., -5.], ids=['default', 'bound2', 'bound5'])
+def test_chunk_gdn2_bwd_intra_lower_bound(layout, dtype, lower_bound, monkeypatch):
+    """Explicit safe-gate bounds must use the Ascend route and match native Triton."""
+    from fla.ops.gdn2.backends.triton_ascend import chunk_intra
+    from fla.ops.gdn2.chunk_intra import chunk_gdn2_bwd_intra
+
+    torch.manual_seed(42)
+    T, H, K, BT = 38, 2, 32, 64
+    shape = (1, T, H, K)
+    tensors = {name: (0.1 * torch.randn(shape, device=device)).to(dtype) for name in ('q', 'k', 'dq', 'dk', 'db')}
+    tensors['b'] = torch.rand(shape, device=device, dtype=dtype)
+    tensors['g'] = -0.1 * torch.rand(shape, device=device)
+    tensors['dg'] = 0.1 * torch.randn(shape, device=device)
+    tensors['dAqk'] = torch.zeros(1, T, H, BT, device=device)
+    tensors['dAkk'] = torch.zeros_like(tensors['dAqk'])
+    bounds = [0, 1, 17, T] if layout == 'varlen' else [0, T]
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        length = end - start
+        tensors['g'][:, start:end] = tensors['g'][:, start:end].cumsum(1)
+        for name, diagonal in [('dAqk', 0), ('dAkk', -1)]:
+            values = torch.randn(H, length, length, device=device).tril(diagonal=diagonal)
+            tensors[name][0, start:end, :, :length] = values.transpose(0, 1)
+    options = dict(
+        cu_seqlens=torch.tensor(bounds, device=device, dtype=torch.int64) if layout == 'varlen' else None,
+        safe_gate=True,
+        lower_bound=lower_bound,
+    )
+    reference = unwrap(chunk_gdn2_bwd_intra)(**{name: x.clone() for name, x in tensors.items()}, **options)
+    spy = Mock(wraps=chunk_intra.chunk_gdn2_bwd_intra_npu)
+    monkeypatch.setattr(chunk_intra, 'chunk_gdn2_bwd_intra_npu', spy)
+    actual = chunk_gdn2_bwd_intra(**{name: x.clone() for name, x in tensors.items()}, **options)
+    spy.assert_called_once()
+    assert spy.call_args.kwargs['lower_bound'] == lower_bound
+    for name, ref, value in zip(('dq', 'dk', 'db', 'dg'), reference, actual):
+        assert_close(name, ref, value, 0.005)
