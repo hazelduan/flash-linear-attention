@@ -1,0 +1,3 @@
+GDN-2 stack 1/4 A2 measurements
+
+Default is the original generic Triton WY implementation compiled and executed by Triton-Ascend. Ascend is the dedicated backend. Both run on the same Ascend910B3. Whole-operator plots compare main b0de6fc8 with implementation ab68bf05. WY is a paired comparison with10warmups,2rounds of30samples in reverse order; whole-operator uses1warmup and3synchronized samples. Seed42. BF16 data; FP32 cumulative gate forWY. CANN9.1.0-beta.1,PyTorch2.10.0,torch_npu2.10.0.post7. Triton-Ascend3.2.2/3.6.0. Measurements include public-entry allocation/dispatch,exclude compilation. Raw samples are in measurements.json.
