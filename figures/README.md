@@ -1,3 +1,9 @@
-GDN-2 stack 1/4 A2 measurements
+# GDN-2 stack 1/4 performance on A2
 
-Whole-operator: main b0de6fc8 vs ba004dcc. WY: the AST-verified original generic Default Triton implementation vs the dedicated Ascend backend at ba004dcc. Each pair runs on the same Ascend910B3, with CANN 9.1.0 and PyTorch 2.10.0. Triton-Ascend 3.2.2 uses torch_npu 2.10.0; 3.6.0 uses 2.10.0.post7. Whole-operator: 3 warmups and 10 synchronized samples per cell. WY: 10 warmups and 60 paired samples per route, reversing order halfway. The two legacy packed full-operator controls also have a 20-warmup/200-sample confirmation; initial and confirmation samples are both retained. Seed 42. BF16 inputs, FP32 cumulative gates for WY. Public allocation/dispatch included; compilation excluded. Raw samples and median/mean/std/min/p10/p90 are in measurements.json.
+These figures describe `ab836839` on Ascend 910B3 with CANN 9.2.0, PyTorch 2.10.0+cpu and torch_npu 2.10.0.post7.
+
+The chunk figure compares the update with post-rebase `23e2e447`. For 3.2.2, the baseline uses the equivalent predicate rewrite that allows the old frontend to compile dense training. Each pair uses the same physical card and CPU-generated BF16 inputs. Device-event medians use 8 warmups and 16 samples.
+
+The WY figure compares generic Triton and dedicated Ascend with the same BF16 inputs and FP32 cumulative gate in each run. Both routes execute on the same NPU. Host timings include allocation and dispatch. The pre-rebase WY comparison uses a separate set of CPU-generated inputs with matching hashes across revisions.
+
+[Measurements](measurements.json) includes the raw samples, paired input hashes, stage profiles, and the pre-rebase comparisons.
